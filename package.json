@@ -1,0 +1,8 @@
+{
+  "name": "stay-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "유킷 스튜디오 숙소 홍보영상 파이프라인용 MCP 브리지 (Higgsfield API + Fish Audio)",
+  "engines": { "node": ">=20" }
+}
