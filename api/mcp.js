@@ -12,7 +12,7 @@ import ffmpegPath from "ffmpeg-static";
 const HF_BASE = (process.env.HF_API_BASE_URL || "https://api.higgsfield.ai").replace(/\/$/, "");
 const FISH_BASE = "https://api.fish.audio";
 const SERVER_NAME = "stay-bridge";
-const SERVER_VERSION = "0.3.2";
+const SERVER_VERSION = "0.4.0";
 
 const num = (v, d) => (Number.isFinite(Number(v)) && v !== "" && v != null ? Number(v) : d);
 const MAX_BATCH_USD = num(process.env.MAX_BATCH_USD, 10); // 한 번에 제출할 수 있는 영상 견적 상한
@@ -434,6 +434,58 @@ async function uploadTickets({ count, content_type }) {
   return { tickets: out };
 }
 
+/* ---------------- 컷 교체: 원본의 시간 구간을 새 클립으로 바꾸고 음악은 원본 그대로 ---------------- */
+async function spliceVideo({ video_url, replacements }) {
+  if (!ffmpegPath) fail("서버에 ffmpeg가 없습니다.");
+  hfKey();
+  const reps = (Array.isArray(replacements) ? replacements : []).map((r) => ({ url: String(r.clip_url || ""), s: num(r.start, NaN), e: num(r.end, NaN), off: Math.max(0, num(r.clip_offset, 0.3)) }));
+  if (!reps.length || reps.length > 6) fail("replacements는 1~6개입니다.");
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "spl-"));
+  try {
+    const vin = path.join(dir, "in.mp4"), out = path.join(dir, "out.mp4");
+    await fetchTo(video_url, vin, 300 * 1024 * 1024);
+    const pr = await run(ffmpegPath, ["-hide_banner", "-i", vin]);
+    const vdur = durOf(pr.err) || fail("영상 길이를 읽지 못했습니다.");
+    const vm = /Stream #\S+.*Video:.*?(\d{2,5})x(\d{2,5})/.exec(pr.err) || fail("영상 크기를 읽지 못했습니다.");
+    const W = +vm[1] - (+vm[1] % 2), H = +vm[2] - (+vm[2] % 2);
+    const fps = (() => { const m = /([\d.]+) fps/.exec(pr.err); const f = m ? +m[1] : 24; return f > 0 && f <= 60 ? f : 24; })();
+    const hasAudio = /Stream #\S+.*Audio:/.test(pr.err);
+    reps.sort((a, b) => a.s - b.s);
+    let prev = 0;
+    for (const r of reps) {
+      if (!(r.s >= 0 && r.e > r.s && r.e <= vdur + 0.05)) fail(`교체 구간(${r.s}~${r.e}초)이 영상 길이(${vdur.toFixed(1)}초)를 벗어납니다.`);
+      if (r.s < prev - 0.01) fail("교체 구간이 서로 겹칩니다.");
+      prev = r.e;
+    }
+    const files = [];
+    for (const [i, r] of reps.entries()) {
+      const f = path.join(dir, `c${i}.mp4`);
+      await fetchTo(r.url, f, 200 * 1024 * 1024);
+      const cd = durOf((await run(ffmpegPath, ["-hide_banner", "-i", f])).err) || fail("새 클립 길이를 읽지 못했습니다.");
+      const need = r.e - r.s;
+      if (cd + 0.05 < need) fail(`새 클립(${cd.toFixed(1)}초)이 바꿀 구간(${need.toFixed(1)}초)보다 짧습니다.`);
+      r.off = Math.min(r.off, Math.max(0, cd - need - 0.02));
+      files.push(f);
+    }
+    const norm = `scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},setsar=1,fps=${fps},format=yuv420p`;
+    const parts = []; let fc = ""; let t = 0, k = 0;
+    const seg = (src, a, b) => { const lab = `s${k++}`; fc += `[${src}:v]trim=start=${a.toFixed(3)}:end=${b.toFixed(3)},setpts=PTS-STARTPTS,${norm}[${lab}];`; parts.push(`[${lab}]`); };
+    reps.forEach((r, i) => { if (r.s - t > 0.04) seg(0, t, r.s); seg(i + 1, r.off, r.off + (r.e - r.s)); t = r.e; });
+    if (vdur - t > 0.04) seg(0, t, vdur);
+    fc += `${parts.join("")}concat=n=${parts.length}:v=1:a=0[v]`;
+    const args = ["-hide_banner", "-y", "-i", vin, ...files.flatMap((f) => ["-i", f]), "-filter_complex", fc, "-map", "[v]"];
+    if (hasAudio) args.push("-map", "0:a:0", "-c:a", "copy");
+    args.push("-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p", "-t", vdur.toFixed(3), "-movflags", "+faststart", out);
+    const r = await run(ffmpegPath, args, 52000);
+    if (r.code !== 0) fail("컷 교체 합성 실패: " + r.err.split("\n").filter(Boolean).slice(-3).join(" / ").slice(0, 300));
+    const buf = await fsp.readFile(out);
+    const tk = await hf("POST", "files/generate-upload-url", { content_type: "video/mp4" });
+    const put = await fetch(tk.upload_url, { method: "PUT", headers: tk.upload_headers || { "Content-Type": "video/mp4" }, body: buf });
+    if (!put.ok) fail(`업로드 실패(${put.status}).`);
+    return { video_url: tk.public_url, bytes: buf.length, video_seconds: +vdur.toFixed(2), width: W, height: H, fps, replaced: reps.map((x) => ({ start: x.s, end: x.e })) };
+  } finally { fsp.rm(dir, { recursive: true, force: true }).catch(() => {}); }
+}
+
 async function statusOf({ request_ids }) {
   if (!Array.isArray(request_ids) || !request_ids.length) fail("request_ids 배열이 필요합니다.");
   if (request_ids.length > 12) fail("한 번에 12개까지 조회할 수 있습니다.");
@@ -613,6 +665,19 @@ const TOOLS = [
     },
     annotations: { readOnlyHint: false, destructiveHint: false },
     run: submitFilm,
+  },
+  {
+    name: "splice_video",
+    description: "영상의 지정한 시간 구간(컷)을 새로 만든 클립으로 바꿔 끼운 영상을 만들고 주소를 돌려준다. 음악·소리는 원본 그대로 둔다. 비용 없음.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        video_url: { type: "string" },
+        replacements: { type: "array", maxItems: 6, items: { type: "object", properties: { clip_url: { type: "string" }, start: { type: "number" }, end: { type: "number" }, clip_offset: { type: "number", description: "새 클립에서 쓰기 시작할 초, 기본 0.3" } }, required: ["clip_url", "start", "end"] } },
+      },
+      required: ["video_url", "replacements"],
+    },
+    run: spliceVideo,
   },
   {
     name: "finalize_video",
