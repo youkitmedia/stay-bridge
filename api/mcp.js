@@ -12,7 +12,7 @@ import ffmpegPath from "ffmpeg-static";
 const HF_BASE = (process.env.HF_API_BASE_URL || "https://api.higgsfield.ai").replace(/\/$/, "");
 const FISH_BASE = "https://api.fish.audio";
 const SERVER_NAME = "stay-bridge";
-const SERVER_VERSION = "0.4.1";
+const SERVER_VERSION = "0.4.2";
 
 const num = (v, d) => (Number.isFinite(Number(v)) && v !== "" && v != null ? Number(v) : d);
 const MAX_BATCH_USD = num(process.env.MAX_BATCH_USD, 10); // 한 번에 제출할 수 있는 영상 견적 상한
@@ -51,7 +51,8 @@ const DEFAULT_MODELS = {
     kind: "seedance",
     duration: [4, 30],
     resolutions: ["480p", "720p"],
-    price: 0.462, // 실측: 720p·고화질 20초 1편 $9.24 (콘솔 2026-10-11). 가격표 최저값 $0.206은 480p 기준
+    price: 0.462, // 실측: 720p·고화질 20초 1편 $9.24 (콘솔 2026-10-11)
+    priceByRes: { "720p": 0.462, "480p": 0.25 }, // 480p는 미실측: 가격표 최저 $0.206에 20% 여유
     r2v: { path: "bytedance/seedance-2.5/reference-to-video", maxRefs: 30 },
     bitrate: true,
   },
@@ -70,7 +71,11 @@ function models() {
   // PRICES_JSON='{"kling-3-pro":0.11}' 처럼 콘솔에서 확인한 단가로 덮어쓰기
   try {
     const over = JSON.parse(process.env.PRICES_JSON || "{}");
-    for (const [k, v] of Object.entries(over)) if (m[k] && Number.isFinite(Number(v))) m[k].price = Number(v);
+    for (const [k, v] of Object.entries(over)) {
+      if (!m[k]) continue;
+      if (Number.isFinite(Number(v))) { m[k].price = Number(v); if (m[k].priceByRes) for (const r of Object.keys(m[k].priceByRes)) m[k].priceByRes[r] = Number(v); }
+      else if (v && typeof v === "object") m[k].priceByRes = { ...(m[k].priceByRes || {}), ...Object.fromEntries(Object.entries(v).filter(([, x]) => Number.isFinite(Number(x))).map(([r, x]) => [r, Number(x)])) };
+    }
   } catch {}
   return m;
 }
@@ -147,12 +152,13 @@ async function bridgeInfo() {
   };
 }
 
-function estimate({ model, duration, clips }) {
+function estimate({ model, duration, clips, resolution }) {
   const m = models()[model] || fail(`알 수 없는 모델: ${model}. 사용 가능: ${Object.keys(models()).join(", ")}`);
   const d = num(duration, 5), n = num(clips, 1);
-  if (m.price == null) return { model, known: false, message: `${m.label} 단가가 등록되지 않았습니다. 콘솔 가격 확인 후 PRICES_JSON에 넣어 주세요.` };
-  const usd = +(m.price * d * n).toFixed(3);
-  return { model, known: true, per_clip_usd_min: +(m.price * d).toFixed(3), total_usd_min: usd, clips: n, duration: d };
+  const price = (resolution && m.priceByRes?.[resolution]) ?? m.price;
+  if (price == null) return { model, known: false, message: `${m.label} 단가가 등록되지 않았습니다. 콘솔 가격 확인 후 PRICES_JSON에 넣어 주세요.` };
+  const usd = +(price * d * n).toFixed(3);
+  return { model, known: true, resolution: resolution || null, price_per_second: price, per_clip_usd_min: +(price * d).toFixed(3), total_usd_min: usd, clips: n, duration: d };
 }
 
 async function uploadImages({ urls, referer }) {
@@ -240,7 +246,7 @@ async function submitFilm({ model, duration, resolution, aspect_ratio, prompt, i
   if (!m.resolutions.includes(res)) fail(`${m.label} 해상도는 ${m.resolutions.join("/")} 중 하나입니다.`);
   const ar = aspect_ratio || "16:9";
   if (!ASPECTS.includes(ar)) fail(`화면비는 ${ASPECTS.join(", ")} 중 하나입니다.`);
-  const est = estimate({ model, duration: d, clips: 1 });
+  const est = estimate({ model, duration: d, clips: 1, resolution: res });
   if (est.known) {
     if (est.total_usd_min > MAX_BATCH_USD) fail(`견적 $${est.total_usd_min}가 서버 상한 $${MAX_BATCH_USD}를 넘습니다.`);
     if (max_total_usd != null && est.total_usd_min > Number(max_total_usd)) fail(`견적 $${est.total_usd_min}가 승인한 한도 $${max_total_usd}를 넘어 제출하지 않았습니다.`);
@@ -582,6 +588,7 @@ const TOOLS = [
         model: { type: "string", enum: Object.keys(DEFAULT_MODELS) },
         duration: { type: "number", description: "클립 길이(초)" },
         clips: { type: "number", description: "클립 수" },
+        resolution: { type: "string", description: "해상도별 단가가 있으면 그 값으로 계산" },
       },
       required: ["model", "duration", "clips"],
     },
