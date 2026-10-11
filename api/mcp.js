@@ -3,10 +3,16 @@
 // Higgsfield API(영상)와 Fish Audio API(나레이션)를 쓰게 한다.
 // API 키는 Vercel 환경변수에서만 읽고, 응답·로그에 절대 싣지 않는다.
 
+import { spawn } from "node:child_process";
+import { promises as fsp } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import ffmpegPath from "ffmpeg-static";
+
 const HF_BASE = (process.env.HF_API_BASE_URL || "https://api.higgsfield.ai").replace(/\/$/, "");
 const FISH_BASE = "https://api.fish.audio";
 const SERVER_NAME = "stay-bridge";
-const SERVER_VERSION = "0.1.0";
+const SERVER_VERSION = "0.2.0";
 
 const num = (v, d) => (Number.isFinite(Number(v)) && v !== "" && v != null ? Number(v) : d);
 const MAX_BATCH_USD = num(process.env.MAX_BATCH_USD, 10); // 한 번에 제출할 수 있는 영상 견적 상한
@@ -37,6 +43,17 @@ const DEFAULT_MODELS = {
     duration: [4, 15],
     resolutions: ["480p", "720p", "1080p"],
     price: 0.141,
+    r2v: { path: "bytedance/seedance-2.0/reference-to-video", maxRefs: 9 },
+  },
+  "seedance-2.5": {
+    label: "Seedance 2.5",
+    path: "bytedance/seedance-2.5/image-to-video",
+    kind: "seedance",
+    duration: [4, 30],
+    resolutions: ["480p", "720p"],
+    price: 0.206,
+    r2v: { path: "bytedance/seedance-2.5/reference-to-video", maxRefs: 30 },
+    bitrate: true,
   },
   "seedance-2-fast": {
     label: "Seedance 2.0 Fast",
@@ -124,7 +141,7 @@ async function bridgeInfo() {
     limits: { max_batch_usd: MAX_BATCH_USD, max_clips: MAX_CLIPS },
     models: Object.fromEntries(Object.entries(m).map(([id, v]) => [id, {
       label: v.label, duration: v.duration, resolutions: v.resolutions || null,
-      price_per_second_min: v.price,
+      price_per_second_min: v.price, film: Boolean(v.r2v), max_refs: v.r2v?.maxRefs || 0,
     }])),
     note: "price_per_second_min은 콘솔 가격표의 최저 사양 단가입니다. 실제 청구액은 해상도·모드에 따라 더 높을 수 있습니다.",
   };
@@ -202,6 +219,116 @@ async function submitVideos({ model, duration, resolution, cfg_scale, clips, max
     results: results.map((r, i) => ({ key: clips[i].key ?? i, ...r })),
     note: "제출 실패한 클립만 다시 제출하세요. 성공한 request_id는 다시 제출하지 마세요.",
   };
+}
+
+const ASPECTS = ["16:9", "4:3", "1:1", "3:4", "9:16", "21:9"];
+/* 참조 이미지 여러 장 + 컷표 프롬프트로 음악까지 포함한 한 편을 한 번에 생성 (비용 발생) */
+async function submitFilm({ model, duration, resolution, aspect_ratio, prompt, image_urls, generate_audio, max_total_usd }) {
+  const m = models()[model] || fail(`알 수 없는 모델: ${model}`);
+  if (!m.r2v) fail(`${m.label}은 참조 이미지 영상(reference-to-video)을 지원하지 않습니다.`);
+  const p = String(prompt || "").trim() || fail("prompt가 비어 있습니다.");
+  if (p.length > 8000) fail("prompt가 너무 깁니다(8000자 이내).");
+  const refs = (Array.isArray(image_urls) ? image_urls : []).map((u) => String(u || "").trim()).filter(Boolean);
+  if (!refs.length) fail("image_urls가 비어 있습니다.");
+  if (refs.length > m.r2v.maxRefs) fail(`${m.label} 참조 이미지는 ${m.r2v.maxRefs}장까지입니다.`);
+  const [lo, hi] = m.duration;
+  const d = Math.round(num(duration, 20));
+  if (d < lo || d > hi) fail(`${m.label}의 길이는 ${lo}~${hi}초입니다.`);
+  const res = resolution || "720p";
+  if (!m.resolutions.includes(res)) fail(`${m.label} 해상도는 ${m.resolutions.join("/")} 중 하나입니다.`);
+  const ar = aspect_ratio || "16:9";
+  if (!ASPECTS.includes(ar)) fail(`화면비는 ${ASPECTS.join(", ")} 중 하나입니다.`);
+  const est = estimate({ model, duration: d, clips: 1 });
+  if (est.known) {
+    if (est.total_usd_min > MAX_BATCH_USD) fail(`견적 $${est.total_usd_min}가 서버 상한 $${MAX_BATCH_USD}를 넘습니다.`);
+    if (max_total_usd != null && est.total_usd_min > Number(max_total_usd)) fail(`견적 $${est.total_usd_min}가 승인한 한도 $${max_total_usd}를 넘어 제출하지 않았습니다.`);
+  } else if (max_total_usd == null) fail(`${m.label}은 단가가 등록되지 않아 자동 제출을 막았습니다.`);
+  const body = { prompt: p, image_urls: refs, duration: d, resolution: res, aspect_ratio: ar, generate_audio: generate_audio !== false, ...(m.bitrate ? { bitrate_mode: "high" } : {}) };
+  const q = await hf("POST", m.r2v.path, body);
+  if (!q.request_id) fail("응답에 request_id가 없습니다.");
+  return { model, estimate: est, request_id: q.request_id, status: q.status || "queued", note: "같은 영상을 다시 제출하지 마세요. video_status로 결과를 확인하세요." };
+}
+
+/* ---------------- 최종본: 영상 음악 위에 마지막 내레이션을 얹고 -14 LUFS로 맞춘다 ---------------- */
+function run(bin, args, timeoutMs = 45000) {
+  return new Promise((resolve) => {
+    const p = spawn(bin, args, { stdio: ["ignore", "ignore", "pipe"] });
+    let err = "";
+    p.stderr.on("data", (c) => { err += c; if (err.length > 200000) err = err.slice(-100000); });
+    const t = setTimeout(() => p.kill("SIGKILL"), timeoutMs);
+    p.on("close", (code) => { clearTimeout(t); resolve({ code, err }); });
+    p.on("error", (e) => { clearTimeout(t); resolve({ code: -1, err: String(e) }); });
+  });
+}
+const durOf = (err) => { const m = /Duration: (\d+):(\d+):([\d.]+)/.exec(err); return m ? +m[1] * 3600 + +m[2] * 60 + +m[3] : 0; };
+async function fetchTo(url, file, max) {
+  let u; try { u = new URL(String(url)); } catch { fail("video_url이 올바르지 않습니다."); }
+  if (u.protocol !== "https:") fail("https 주소만 받을 수 있습니다.");
+  const r = await fetch(u.href);
+  if (!r.ok) fail(`영상을 내려받지 못했습니다(${r.status}).`);
+  const buf = Buffer.from(await r.arrayBuffer());
+  if (buf.length > max) fail("영상이 너무 큽니다.");
+  await fsp.writeFile(file, buf);
+  return buf.length;
+}
+async function finalizeVideo({ video_url, narration_base64, narration_start, end_pad, duck, lufs }) {
+  hfKey();
+  if (!ffmpegPath) fail("서버에 ffmpeg가 없습니다.");
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "fin-"));
+  try {
+    const vin = path.join(dir, "in.mp4"), nin = path.join(dir, "n.mp3"), out = path.join(dir, "out.mp4");
+    await fetchTo(video_url, vin, 300 * 1024 * 1024);
+    const probe = await run(ffmpegPath, ["-hide_banner", "-i", vin]);
+    const vdur = durOf(probe.err) || fail("영상 길이를 읽지 못했습니다.");
+    const hasAudio = /Stream #\S+.*Audio:/.test(probe.err);
+    let ndur = 0, start = 0;
+    const narr = String(narration_base64 || "");
+    if (narr) {
+      const nb = Buffer.from(narr, "base64");
+      if (nb.length < 100) fail("내레이션 오디오가 비어 있습니다.");
+      if (nb.length > 5 * 1024 * 1024) fail("내레이션 오디오가 너무 큽니다.");
+      await fsp.writeFile(nin, nb);
+      ndur = durOf((await run(ffmpegPath, ["-hide_banner", "-i", nin])).err) || fail("내레이션 길이를 읽지 못했습니다.");
+      if (ndur > vdur - 0.5) fail(`내레이션(${ndur.toFixed(1)}초)이 영상(${vdur.toFixed(1)}초)보다 깁니다.`);
+      const pad = Math.min(3, Math.max(0, num(end_pad, 0.6)));
+      start = narration_start != null ? Math.max(0, Math.min(num(narration_start, 0), vdur - ndur)) : Math.max(0, vdur - ndur - pad);
+    }
+    const target = Math.min(-9, Math.max(-24, num(lufs, -14)));
+    const keep = Math.min(1, Math.max(0.1, num(duck, 0.4))); // 내레이션 동안 음악을 이 비율로 낮춤
+    const mix = path.join(dir, "mix.wav");
+    const args = ["-hide_banner", "-y", "-i", vin];
+    let fc;
+    const music = hasAudio ? "[0:a]aresample=48000,aformat=channel_layouts=stereo" : `anullsrc=r=48000:cl=stereo,atrim=0:${vdur.toFixed(3)}`;
+    if (narr) {
+      args.push("-i", nin);
+      const ds = Math.max(0, start - 0.4).toFixed(3), ms = Math.round(start * 1000);
+      // 음악은 그대로 두고 내레이션 0.4초 전부터 keep 비율로 낮춘다. 내레이션은 음악보다 또렷하게 미리 맞춘다.
+      fc = `${music},volume=eval=frame:volume='1-${(1 - keep).toFixed(3)}*clip((t-${ds})/0.4,0,1)'[m];` +
+        `[1:a]aresample=48000,aformat=channel_layouts=stereo,loudnorm=I=${target + 1}:TP=-2:LRA=7,adelay=${ms}|${ms}[n];` +
+        `[m][n]amix=inputs=2:normalize=0:duration=first[a]`;
+    } else {
+      fc = `${music}[a]`;
+    }
+    args.push("-filter_complex", fc, "-map", "[a]", "-t", vdur.toFixed(3), "-c:a", "pcm_s16le", mix);
+    let r = await run(ffmpegPath, args, 30000);
+    if (r.code !== 0) fail("소리 합성 실패: " + r.err.split("\n").filter(Boolean).slice(-3).join(" / ").slice(0, 300));
+    // 2패스 음량 정규화: 측정 → 선형 보정 (-14 LUFS, 최고치 -1 dBTP)
+    const ln = `loudnorm=I=${target}:TP=-1:LRA=11`;
+    const meas = await run(ffmpegPath, ["-hide_banner", "-i", mix, "-af", `${ln}:print_format=json`, "-f", "null", "-"], 20000);
+    let M = null; try { M = JSON.parse(meas.err.slice(meas.err.lastIndexOf("{"), meas.err.lastIndexOf("}") + 1)); } catch {}
+    const silent = !M || !Number.isFinite(Number(M.input_i)) || Number(M.input_i) < -60;
+    const af = silent ? "anull" : `${ln}:measured_I=${M.input_i}:measured_TP=${M.input_tp}:measured_LRA=${M.input_lra}:measured_thresh=${M.input_thresh}:offset=${M.target_offset}:linear=true,aresample=48000`;
+    r = await run(ffmpegPath, ["-hide_banner", "-y", "-i", vin, "-i", mix, "-map", "0:v:0", "-map", "1:a", "-af", af, "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-t", vdur.toFixed(3), "-movflags", "+faststart", out], 40000);
+    if (r.code !== 0) fail("최종본 합성 실패: " + r.err.split("\n").filter(Boolean).slice(-3).join(" / ").slice(0, 300));
+    const buf = await fsp.readFile(out);
+    const ticket = await hf("POST", "files/generate-upload-url", { content_type: "video/mp4" });
+    const put = await fetch(ticket.upload_url, { method: "PUT", headers: ticket.upload_headers || { "Content-Type": "video/mp4" }, body: buf });
+    if (!put.ok) fail(`최종본 업로드 실패(${put.status}).`);
+    return { final_url: ticket.public_url, bytes: buf.length, video_seconds: +vdur.toFixed(2), had_audio: hasAudio,
+      narration_start: narr ? +start.toFixed(2) : null, narration_seconds: narr ? +ndur.toFixed(2) : null, lufs: target };
+  } finally {
+    fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 async function statusOf({ request_ids }) {
@@ -346,6 +473,43 @@ const TOOLS = [
     run: submitVideos,
   },
   {
+    name: "submit_film",
+    description: "참조 이미지 여러 장과 컷표 프롬프트로 음악·효과음이 포함된 홍보영상 한 편을 생성 요청한다(비용 발생). 견적이 서버 상한이나 max_total_usd를 넘으면 제출하지 않는다. 같은 영상을 두 번 제출하지 말 것.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        model: { type: "string", enum: Object.keys(DEFAULT_MODELS).filter((k) => DEFAULT_MODELS[k].r2v) },
+        duration: { type: "number", description: "영상 길이(초)" },
+        resolution: { type: "string", description: "480p/720p(2.5) 또는 480p/720p/1080p(2.0)" },
+        aspect_ratio: { type: "string", enum: ASPECTS },
+        prompt: { type: "string", description: "컷표가 들어간 영상 문안. 참조 이미지는 '이미지1'처럼 순서 번호로 가리킨다." },
+        image_urls: { type: "array", items: { type: "string" }, maxItems: 30 },
+        generate_audio: { type: "boolean", description: "음악·효과음 생성, 기본 true" },
+        max_total_usd: { type: "number", description: "사용자가 승인한 총액 한도" },
+      },
+      required: ["model", "duration", "prompt", "image_urls"],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false },
+    run: submitFilm,
+  },
+  {
+    name: "finalize_video",
+    description: "완성된 영상에 마지막 내레이션(mp3 base64)을 얹고 음악을 살짝 낮춘 뒤 -14 LUFS·최고치 -1dB로 맞춘 최종 mp4를 만들어 다운로드 주소를 돌려준다. 내레이션 없이 음량만 맞출 수도 있다. 영상 재생성 비용은 없다.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        video_url: { type: "string" },
+        narration_base64: { type: "string", description: "tts가 돌려준 audio_base64" },
+        narration_start: { type: "number", description: "내레이션 시작 초. 없으면 끝에 맞춘다" },
+        end_pad: { type: "number", description: "내레이션이 끝난 뒤 남길 여백(초), 기본 0.6" },
+        duck: { type: "number", description: "내레이션 동안 음악 음량 비율 0.1~1, 기본 0.4" },
+        lufs: { type: "number", description: "목표 음량, 기본 -14" },
+      },
+      required: ["video_url"],
+    },
+    run: finalizeVideo,
+  },
+  {
     name: "video_status",
     description: "제출한 요청들의 상태와 완료된 영상 URL을 조회한다. 최대 12개.",
     inputSchema: {
@@ -418,7 +582,7 @@ async function handleRpc(msg) {
         protocolVersion: SUPPORTED.includes(asked) ? asked : SUPPORTED[0],
         capabilities: { tools: { listChanged: false } },
         serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
-        instructions: "유킷 스튜디오 숙소 홍보영상 파이프라인용 브리지. submit_videos는 비용이 발생하므로 사용자 승인 후 한 번만 호출할 것.",
+        instructions: "유킷 스튜디오 숙소 홍보영상 파이프라인용 브리지. submit_videos와 submit_film은 비용이 발생하므로 사용자 승인 후 한 번만 호출할 것.",
       });
     }
     case "ping":

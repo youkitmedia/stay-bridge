@@ -1,9 +1,16 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "rewrites": [
-    { "source": "/m/:token", "destination": "/api/mcp?token=:token" }
+    {
+      "source": "/m/:token",
+      "destination": "/api/mcp?token=:token"
+    }
   ],
   "functions": {
-    "api/mcp.js": { "maxDuration": 60 }
+    "api/mcp.js": {
+      "maxDuration": 60,
+      "memory": 1769,
+      "includeFiles": "node_modules/ffmpeg-static/ffmpeg"
+    }
   }
 }

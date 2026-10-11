@@ -32,6 +32,8 @@
 | `cancel_video` | 없음 | 대기 중 요청 취소 |
 | `tts` | 무료 모델 기준 없음 | Fish Audio 나레이션 한 줄 → mp3(base64) |
 | `tts_voices` | 없음 | 한국어·라이선스 확보 목소리 검색 |
+| `submit_film` | **발생** | 참조 사진 여러 장 + 컷표 프롬프트로 음악 포함 홍보영상 한 편 생성 (Seedance 2.5/2.0 reference-to-video) |
+| `finalize_video` | 없음 | 완성 영상에 마지막 내레이션을 얹고 음악을 살짝 낮춘 뒤 -14 LUFS·-1 dBTP로 맞춘 최종 mp4 주소 반환 |
 
 ## 모델 경로
 
@@ -41,6 +43,10 @@
 - Kling 3.0 Pro: `kling-video/v3.0/pro/image-to-video`
 - Seedance 2.0: `bytedance/seedance-2.0/image-to-video`
 - Seedance 2.0 Fast: `bytedance/seedance-2.0/fast/image-to-video`
+- Seedance 2.0 참조 영상: `bytedance/seedance-2.0/reference-to-video` (참조 9장, 4~15초, 1080p 가능)
+- Seedance 2.5 참조 영상: `bytedance/seedance-2.5/reference-to-video` (참조 30장, 4~30초, 480p/720p)
+
+최종본 합성은 `ffmpeg-static`(GPL 바이너리)을 함수에 포함해 처리합니다(`vercel.json`의 `includeFiles`).
 
 ## 보안
 
