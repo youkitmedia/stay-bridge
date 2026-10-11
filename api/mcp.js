@@ -12,7 +12,7 @@ import ffmpegPath from "ffmpeg-static";
 const HF_BASE = (process.env.HF_API_BASE_URL || "https://api.higgsfield.ai").replace(/\/$/, "");
 const FISH_BASE = "https://api.fish.audio";
 const SERVER_NAME = "stay-bridge";
-const SERVER_VERSION = "0.3.0";
+const SERVER_VERSION = "0.3.1";
 
 const num = (v, d) => (Number.isFinite(Number(v)) && v !== "" && v != null ? Number(v) : d);
 const MAX_BATCH_USD = num(process.env.MAX_BATCH_USD, 10); // 한 번에 제출할 수 있는 영상 견적 상한
@@ -340,7 +340,9 @@ const ENT = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", middo
 const unent = (s) => String(s || "").replace(/&(#x[0-9a-f]+|#\d+|\w+);/gi, (m, e) => e[0] === "#" ? String.fromCodePoint(e[1] === "x" || e[1] === "X" ? parseInt(e.slice(2), 16) : +e.slice(1)) : (ENT[e.toLowerCase()] ?? m));
 const attr = (tag, name) => { const m = new RegExp(`\\s${name}\\s*=\\s*("([^"]*)"|'([^']*)'|([^\\s>]+))`, "i").exec(tag); return m ? unent(m[2] ?? m[3] ?? m[4] ?? "").trim() : ""; };
 async function getHtml(url) {
-  const r = await fetch(url, { headers: { "User-Agent": UA, Accept: "text/html,application/xhtml+xml,*/*;q=0.8", "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.5" }, redirect: "follow", signal: AbortSignal.timeout(12000) });
+  let r;
+  try { r = await fetch(url, { headers: { "User-Agent": UA, Accept: "text/html,application/xhtml+xml,*/*;q=0.8", "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.5" }, redirect: "follow", signal: AbortSignal.timeout(12000) }); }
+  catch (e) { fail(e?.name === "TimeoutError" ? "사이트가 응답하지 않습니다(12초 초과)." : "사이트가 서버 접속을 거부했습니다. 클라우드 서버를 막는 사이트라 사진 파일을 직접 올려야 합니다."); }
   if (!r.ok) fail(`사이트가 ${r.status}로 응답했습니다.`);
   const buf = Buffer.from(await r.arrayBuffer());
   let cs = (/charset=([\w-]+)/i.exec(r.headers.get("content-type") || "") || [])[1];
@@ -411,6 +413,17 @@ async function scrapeSite({ url, max_pages, max_images }) {
     return { ok: out.length > 0, pages, images: out, blocked: home.challenge, candidates: cands.length, seconds: +((Date.now() - T0) / 1000).toFixed(1),
       note: home.challenge ? "사이트가 자바스크립트 쿠키 확인을 요구해 서버 수집이 막혔습니다." : undefined };
   } finally { fsp.rm(dir, { recursive: true, force: true }).catch(() => {}); }
+}
+/* 사용자 컴퓨터에서 고른 사진(base64)을 Higgsfield 저장소에 올린다 */
+async function uploadData({ data_base64, content_type }) {
+  const buf = Buffer.from(String(data_base64 || ""), "base64");
+  if (buf.length < 1000) fail("사진 데이터가 비어 있습니다.");
+  if (buf.length > 4 * 1024 * 1024) fail("사진이 4MB를 넘습니다. 줄여서 올려 주세요.");
+  const type = sniffType(buf, content_type) || fail("jpeg/png/webp 사진만 올릴 수 있습니다.");
+  const t = await hf("POST", "files/generate-upload-url", { content_type: type });
+  const put = await fetch(t.upload_url, { method: "PUT", headers: t.upload_headers || { "Content-Type": type }, body: buf });
+  if (!put.ok) fail(`Higgsfield 저장소 업로드 실패(${put.status}).`);
+  return { public_url: t.public_url, bytes: buf.length, content_type: type };
 }
 /* 클라우드 브라우저가 받은 사진을 직접 올릴 수 있도록 미리 서명된 업로드 주소를 발급 */
 async function uploadTickets({ count, content_type }) {
@@ -568,6 +581,12 @@ const TOOLS = [
     inputSchema: { type: "object", properties: { url: { type: "string" }, max_pages: { type: "number" }, max_images: { type: "number" } }, required: ["url"] },
     annotations: { readOnlyHint: true },
     run: scrapeSite,
+  },
+  {
+    name: "upload_data",
+    description: "사용자가 직접 고른 사진 파일(base64, 4MB 이하)을 Higgsfield 저장소에 올리고 영상 입력용 public_url을 돌려준다. 비용 없음.",
+    inputSchema: { type: "object", properties: { data_base64: { type: "string" }, content_type: { type: "string" } }, required: ["data_base64"] },
+    run: uploadData,
   },
   {
     name: "upload_tickets",
