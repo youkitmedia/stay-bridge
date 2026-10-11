@@ -12,7 +12,7 @@ import ffmpegPath from "ffmpeg-static";
 const HF_BASE = (process.env.HF_API_BASE_URL || "https://api.higgsfield.ai").replace(/\/$/, "");
 const FISH_BASE = "https://api.fish.audio";
 const SERVER_NAME = "stay-bridge";
-const SERVER_VERSION = "0.3.1";
+const SERVER_VERSION = "0.3.2";
 
 const num = (v, d) => (Number.isFinite(Number(v)) && v !== "" && v != null ? Number(v) : d);
 const MAX_BATCH_USD = num(process.env.MAX_BATCH_USD, 10); // 한 번에 제출할 수 있는 영상 견적 상한
@@ -273,7 +273,7 @@ async function fetchTo(url, file, max) {
   await fsp.writeFile(file, buf);
   return buf.length;
 }
-async function finalizeVideo({ video_url, narration_base64, narration_start, end_pad, duck, lufs }) {
+async function finalizeVideo({ video_url, narration_base64, narration_start, end_pad, duck, lufs, mute_original }) {
   hfKey();
   if (!ffmpegPath) fail("서버에 ffmpeg가 없습니다.");
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "fin-"));
@@ -300,7 +300,7 @@ async function finalizeVideo({ video_url, narration_base64, narration_start, end
     const mix = path.join(dir, "mix.wav");
     const args = ["-hide_banner", "-y", "-i", vin];
     let fc;
-    const music = hasAudio ? "[0:a]aresample=48000,aformat=channel_layouts=stereo" : `anullsrc=r=48000:cl=stereo,atrim=0:${vdur.toFixed(3)}`;
+    const music = hasAudio && !mute_original ? "[0:a]aresample=48000,aformat=channel_layouts=stereo" : `anullsrc=r=48000:cl=stereo,atrim=0:${vdur.toFixed(3)}`;
     if (narr) {
       args.push("-i", nin);
       const ds = Math.max(0, start - 0.4).toFixed(3), ms = Math.round(start * 1000);
@@ -626,6 +626,7 @@ const TOOLS = [
         end_pad: { type: "number", description: "내레이션이 끝난 뒤 남길 여백(초), 기본 0.6" },
         duck: { type: "number", description: "내레이션 동안 음악 음량 비율 0.1~1, 기본 0.4" },
         lufs: { type: "number", description: "목표 음량, 기본 -14" },
+        mute_original: { type: "boolean", description: "원본 영상 소리를 빼고 내레이션만 남긴다" },
       },
       required: ["video_url"],
     },
