@@ -12,5 +12,8 @@
       "memory": 1769,
       "includeFiles": "node_modules/ffmpeg-static/ffmpeg"
     }
-  }
+  },
+  "regions": [
+    "icn1"
+  ]
 }

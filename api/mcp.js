@@ -12,7 +12,7 @@ import ffmpegPath from "ffmpeg-static";
 const HF_BASE = (process.env.HF_API_BASE_URL || "https://api.higgsfield.ai").replace(/\/$/, "");
 const FISH_BASE = "https://api.fish.audio";
 const SERVER_NAME = "stay-bridge";
-const SERVER_VERSION = "0.2.0";
+const SERVER_VERSION = "0.3.0";
 
 const num = (v, d) => (Number.isFinite(Number(v)) && v !== "" && v != null ? Number(v) : d);
 const MAX_BATCH_USD = num(process.env.MAX_BATCH_USD, 10); // 한 번에 제출할 수 있는 영상 견적 상한
@@ -168,8 +168,10 @@ async function uploadImages({ urls, referer }) {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
         Referer: referer || `${u.protocol}//${u.host}/`,
         Accept: "image/avif,image/webp,image/*,*/*;q=0.8",
+        "Accept-Language": "ko-KR,ko;q=0.9",
       },
       redirect: "follow",
+      signal: AbortSignal.timeout(15000),
     });
     if (!r.ok) fail(`원본 사진을 가져오지 못했습니다(${r.status}). 사이트가 외부 가져오기를 막았을 수 있습니다.`);
     const buf = await r.arrayBuffer();
@@ -331,6 +333,94 @@ async function finalizeVideo({ video_url, narration_base64, narration_start, end
   }
 }
 
+/* ---------------- 사이트 수집 (서울 리전에서 실행: 해외 접속을 막는 국내 숙소 사이트 대응) ---------------- */
+const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
+const GROUP_RE = [/pool|수영|풀장|infinity|facilit|부대시설|시설/i, /room|객실|suite|스위트|villa|빌라|숙박/i, /spa|스파|sauna|사우나|온천|rooftop|루프탑|lounge|라운지|activity|gallery|갤러리|terrace|테라스|garden|정원/i, /dining|다이닝|restaurant|레스토랑|cafe|카페/i];
+const ENT = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", middot: "·" };
+const unent = (s) => String(s || "").replace(/&(#x[0-9a-f]+|#\d+|\w+);/gi, (m, e) => e[0] === "#" ? String.fromCodePoint(e[1] === "x" || e[1] === "X" ? parseInt(e.slice(2), 16) : +e.slice(1)) : (ENT[e.toLowerCase()] ?? m));
+const attr = (tag, name) => { const m = new RegExp(`\\s${name}\\s*=\\s*("([^"]*)"|'([^']*)'|([^\\s>]+))`, "i").exec(tag); return m ? unent(m[2] ?? m[3] ?? m[4] ?? "").trim() : ""; };
+async function getHtml(url) {
+  const r = await fetch(url, { headers: { "User-Agent": UA, Accept: "text/html,application/xhtml+xml,*/*;q=0.8", "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.5" }, redirect: "follow", signal: AbortSignal.timeout(12000) });
+  if (!r.ok) fail(`사이트가 ${r.status}로 응답했습니다.`);
+  const buf = Buffer.from(await r.arrayBuffer());
+  let cs = (/charset=([\w-]+)/i.exec(r.headers.get("content-type") || "") || [])[1];
+  if (!cs) cs = (/<meta[^>]+charset=["']?([\w-]+)/i.exec(buf.subarray(0, 6000).toString("latin1")) || [])[1];
+  cs = String(cs || "utf-8").toLowerCase().replace(/^(ks_c_5601-1987|ksc5601|cp949)$/, "euc-kr");
+  let html; try { html = new TextDecoder(cs).decode(buf); } catch { html = buf.toString("utf8"); }
+  return { html, url: r.url || url };
+}
+function extract(html, base) {
+  const abs = (u) => { try { const x = new URL(u, base); return /^https?:$/.test(x.protocol) ? x.href : null; } catch { return null; } };
+  const title = unent((/<title[^>]*>([\s\S]*?)<\/title>/i.exec(html) || [])[1] || "").trim();
+  const metaTag = (n) => { const m = new RegExp(`<meta[^>]+(?:name|property)=["']${n}["'][^>]*>`, "i").exec(html); return m ? attr(m[0], "content") : ""; };
+  const desc = metaTag("description") || metaTag("og:description");
+  const text = unent(html.replace(/<(script|style|noscript|svg)[\s\S]*?<\/\1>/gi, " ").replace(/<[^>]+>/g, " ")).replace(/\s+/g, " ").trim().slice(0, 4000);
+  const imgs = [], seen = new Set();
+  const add = (u, alt) => { const a = abs(u); if (!a || seen.has(a) || a.startsWith("data:")) return; seen.add(a); imgs.push({ url: a, alt: String(alt || "").slice(0, 80) }); };
+  const og = metaTag("og:image"); if (og) add(og, "og:image");
+  for (const m of html.matchAll(/<(img|source)\b[^>]*>/gi)) {
+    const t = m[0], alt = attr(t, "alt") || attr(t, "title");
+    for (const n of ["data-src", "data-original", "data-lazy-src", "data-lazy", "src"]) { const v = attr(t, n); if (v && !v.startsWith("data:")) { add(v, alt); break; } }
+    const ss = attr(t, "data-srcset") || attr(t, "srcset"); if (ss) add(ss.split(",").pop().trim().split(/\s+/)[0], alt);
+  }
+  for (const m of html.matchAll(/url\(\s*['"]?([^'")]+?\.(?:jpe?g|png|webp)(?:\?[^'")]*)?)['"]?\s*\)/gi)) add(m[1], "");
+  const links = [];
+  for (const m of html.matchAll(/<a\b[^>]*href\s*=\s*["']([^"'#]+)[^>]*>([\s\S]*?)<\/a>/gi)) { const a = abs(m[1]); if (a) links.push({ h: a, t: unent(m[2].replace(/<[^>]+>/g, " ")).replace(/\s+/g, " ").trim().slice(0, 40) }); }
+  return { title, desc, text, imgs, links, challenge: /slowAES|cupid\.js|cf-chl|challenge-platform/i.test(html) && text.length < 200 };
+}
+async function thumbOf(url, referer, dir, i) {
+  const r = await fetch(url, { headers: { "User-Agent": UA, Referer: referer, Accept: "image/avif,image/webp,image/*,*/*;q=0.8" }, redirect: "follow", signal: AbortSignal.timeout(9000) });
+  if (!r.ok) return null;
+  const buf = Buffer.from(await r.arrayBuffer());
+  if (buf.length < 8000 || buf.length > 12 * 1024 * 1024 || !sniffType(buf, r.headers.get("content-type"))) return null;
+  const f = path.join(dir, `i${i}`), t = path.join(dir, `t${i}.jpg`), hsh = path.join(dir, `h${i}.raw`);
+  await fsp.writeFile(f, buf);
+  const x = await run(ffmpegPath, ["-hide_banner", "-y", "-i", f, "-filter_complex", "[0:v]split=2[a][b];[a]scale=200:150:force_original_aspect_ratio=increase,crop=200:150[t];[b]scale=8:8,format=gray[h]", "-map", "[t]", "-frames:v", "1", "-q:v", "7", t, "-map", "[h]", "-frames:v", "1", "-f", "rawvideo", hsh], 10000);
+  const m = /Stream #.*Video:.*?(\d{2,5})x(\d{2,5})/.exec(x.err);
+  if (x.code !== 0 || !m) return null;
+  const W = +m[1], H = +m[2];
+  if (Math.min(W, H) < 380 || W / H > 3.2 || H / W > 2.2) return null;
+  return { w: W, h: H, kb: Math.round(buf.length / 1024), thumb: (await fsp.readFile(t)).toString("base64"), hash: (await fsp.readFile(hsh)).toString("hex") };
+}
+async function scrapeSite({ url, max_pages, max_images }) {
+  if (!ffmpegPath) fail("서버에 ffmpeg가 없습니다.");
+  let u; try { u = new URL(String(url)); } catch { fail("올바른 URL이 아닙니다."); }
+  const T0 = Date.now(), maxP = Math.min(6, Math.max(1, num(max_pages, 5))), maxI = Math.min(36, Math.max(4, num(max_images, 30)));
+  const first = await getHtml(u.href);
+  const home = extract(first.html, first.url);
+  const pages = [{ url: first.url, title: home.title, desc: home.desc, text: home.text }];
+  const perPage = [home.imgs];
+  const host = new URL(first.url).host.replace(/^www\./, ""), pick = [];
+  for (const g of GROUP_RE) for (const l of home.links) {
+    if (pick.length >= maxP - 1) break;
+    let h; try { h = new URL(l.h); } catch { continue; }
+    const key = h.href.split("#")[0];
+    if (h.host.replace(/^www\./, "") !== host || key === first.url || pick.includes(key) || /\.(jpe?g|png|pdf|zip)$/i.test(h.pathname)) continue;
+    if (g.test(decodeURIComponent(h.pathname + h.search) + " " + l.t)) { pick.push(key); break; }
+  }
+  const subs = await pool(pick, 3, async (p) => { const r = await getHtml(p); return { p: r.url, x: extract(r.html, r.url) }; });
+  for (const s of subs) if (s && !s.error) { pages.push({ url: s.p, title: s.x.title, desc: "", text: s.x.text.slice(0, 2500) }); perPage.push(s.x.imgs); }
+  const order = [], seen = new Set();
+  for (let k = 0; perPage.some((a) => a.length > k); k++) perPage.forEach((a, pi) => { const im = a[k]; if (im && !seen.has(im.url)) { seen.add(im.url); order.push({ ...im, page: pi }); } });
+  const cands = order.filter((im) => !/\.svg|\.gif|logo|icon|sprite|blank|btn_|\/ico|favicon|loading|arrow|bullet/i.test(im.url)).slice(0, 70);
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "scr-"));
+  try {
+    const res = await pool(cands, 6, async (im, i) => (Date.now() - T0 > 42000 ? null : thumbOf(im.url, pages[im.page]?.url || first.url, dir, i)));
+    const out = [], hs = new Set();
+    res.forEach((r, i) => { if (r && !r.error && !hs.has(r.hash) && out.length < maxI) { hs.add(r.hash); const { hash, ...rest } = r; out.push({ url: cands[i].url, alt: cands[i].alt, page: cands[i].page, ...rest }); } });
+    return { ok: out.length > 0, pages, images: out, blocked: home.challenge, candidates: cands.length, seconds: +((Date.now() - T0) / 1000).toFixed(1),
+      note: home.challenge ? "사이트가 자바스크립트 쿠키 확인을 요구해 서버 수집이 막혔습니다." : undefined };
+  } finally { fsp.rm(dir, { recursive: true, force: true }).catch(() => {}); }
+}
+/* 클라우드 브라우저가 받은 사진을 직접 올릴 수 있도록 미리 서명된 업로드 주소를 발급 */
+async function uploadTickets({ count, content_type }) {
+  const n = Math.min(12, Math.max(1, Math.round(num(count, 1))));
+  const ct = ["image/jpeg", "image/png", "image/webp"].includes(content_type) ? content_type : "image/jpeg";
+  const out = [];
+  for (let i = 0; i < n; i++) { const t = await hf("POST", "files/generate-upload-url", { content_type: ct }); out.push({ upload_url: t.upload_url, upload_headers: t.upload_headers || { "Content-Type": ct }, public_url: t.public_url }); }
+  return { tickets: out };
+}
+
 async function statusOf({ request_ids }) {
   if (!Array.isArray(request_ids) || !request_ids.length) fail("request_ids 배열이 필요합니다.");
   if (request_ids.length > 12) fail("한 번에 12개까지 조회할 수 있습니다.");
@@ -471,6 +561,19 @@ const TOOLS = [
     },
     annotations: { readOnlyHint: false, destructiveHint: false },
     run: submitVideos,
+  },
+  {
+    name: "scrape_site",
+    description: "숙소 공식 사이트를 서울 리전 서버에서 읽어 본문 텍스트와 큰 사진 후보(썸네일 포함)를 모은다. 해외 접속을 막는 국내 사이트용. 비용 없음.",
+    inputSchema: { type: "object", properties: { url: { type: "string" }, max_pages: { type: "number" }, max_images: { type: "number" } }, required: ["url"] },
+    annotations: { readOnlyHint: true },
+    run: scrapeSite,
+  },
+  {
+    name: "upload_tickets",
+    description: "Higgsfield 저장소에 사진을 직접 올릴 수 있는 일회용 업로드 주소를 발급한다(최대 12개). 비용 없음.",
+    inputSchema: { type: "object", properties: { count: { type: "number" }, content_type: { type: "string" } }, required: ["count"] },
+    run: uploadTickets,
   },
   {
     name: "submit_film",
