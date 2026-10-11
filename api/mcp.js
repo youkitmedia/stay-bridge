@@ -12,7 +12,7 @@ import ffmpegPath from "ffmpeg-static";
 const HF_BASE = (process.env.HF_API_BASE_URL || "https://api.higgsfield.ai").replace(/\/$/, "");
 const FISH_BASE = "https://api.fish.audio";
 const SERVER_NAME = "stay-bridge";
-const SERVER_VERSION = "0.4.0";
+const SERVER_VERSION = "0.4.1";
 
 const num = (v, d) => (Number.isFinite(Number(v)) && v !== "" && v != null ? Number(v) : d);
 const MAX_BATCH_USD = num(process.env.MAX_BATCH_USD, 10); // 한 번에 제출할 수 있는 영상 견적 상한
@@ -51,7 +51,7 @@ const DEFAULT_MODELS = {
     kind: "seedance",
     duration: [4, 30],
     resolutions: ["480p", "720p"],
-    price: 0.206,
+    price: 0.462, // 실측: 720p·고화질 20초 1편 $9.24 (콘솔 2026-10-11). 가격표 최저값 $0.206은 480p 기준
     r2v: { path: "bytedance/seedance-2.5/reference-to-video", maxRefs: 30 },
     bitrate: true,
   },
